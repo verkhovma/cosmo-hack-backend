@@ -210,6 +210,29 @@ def _classify_reason(
 # ---------------------------------------------------------------------------
 # Полный расчёт с маршрутами и причинами
 # ---------------------------------------------------------------------------
+def calc_snapshot_satellites(scenario: dict, t_s: float) -> dict:
+    snap = geometry.snapshot(scenario, float(t_s))
+
+    # видимость спутников для каждого наземного пункта
+    sat_visible: dict[str, list[str]] = {
+        s["id"]: [] for s in scenario["design"]["satellites"]
+    }
+    for a, b, _ in snap["edges"]:
+        if a.startswith("S") and not b.startswith("S"):
+            sat_visible.setdefault(a, []).append(b)
+        elif b.startswith("S") and not a.startswith("S"):
+            sat_visible.setdefault(b, []).append(a)
+
+    return {
+        "t_s": t_s,
+        "satellites": [
+            {**s, "visible_to": sat_visible.get(s["id"], [])}
+            for s in snap["satellites"]
+        ],
+        "edges": snap["edges"],
+    }
+
+
 
 def _run_computation(scenario: dict) -> dict:
     """
@@ -234,37 +257,19 @@ def _run_computation(scenario: dict) -> dict:
     # visible_log[client_id][t_index] = [sat_id, ...]
     visible_log: dict[str, list[list[str]]] = {c: [] for c in clients}
 
-    snapshots_compact: list[dict] = []
+    #snapshots_compact: list[dict] = []
 
     t0 = time.perf_counter()
 
     for t in times:
         snap = geometry.snapshot(scenario, float(t))
+        #snapshots_compact.append()
 
         # строим граф смежности
         adj: dict[str, list[tuple[str, float]]] = {}
         for a, b, w in snap["edges"]:
             adj.setdefault(a, []).append((b, w))
             adj.setdefault(b, []).append((a, w))
-
-        # видимость спутников для каждого наземного пункта
-        sat_visible: dict[str, list[str]] = {
-            s["id"]: [] for s in scenario["design"]["satellites"]
-        }
-        for a, b, _ in snap["edges"]:
-            if a.startswith("S") and not b.startswith("S"):
-                sat_visible.setdefault(a, []).append(b)
-            elif b.startswith("S") and not a.startswith("S"):
-                sat_visible.setdefault(b, []).append(a)
-
-        snapshots_compact.append({
-            "t_s": t,
-            "satellites": [
-                {**s, "visible_to": sat_visible.get(s["id"], [])}
-                for s in snap["satellites"]
-            ],
-            "edges": snap["edges"],
-        })
 
         for cid in clients:
             # BFS до ближайшего шлюза
@@ -317,7 +322,7 @@ def _run_computation(scenario: dict) -> dict:
         "computed_at": time.time(),
         "elapsed_s": elapsed,
         "time_grid": times,
-        "snapshots": snapshots_compact,
+        #"snapshots": snapshots_compact,
         "routes": routes,
         "visible_log": visible_log,
         "metrics": metrics,
@@ -399,11 +404,6 @@ def _apply_edits(scenario: dict, edits: EditScenarioPayload) -> dict:
 # ---------------------------------------------------------------------------
 # Эндпоинты: сценарии
 # ---------------------------------------------------------------------------
-@app.get("/api/health")
-def health() -> dict:
-    return {"status": "ok", "schema_in": geometry.SCHEMA_IN, "schema_out": SCHEMA_OUT}
-
-
 @app.get("/api/scenarios")
 def list_scenarios() -> list[dict]:
     if not DATA_DIR.is_dir():
@@ -501,7 +501,8 @@ def get_snapshot(job_id: str, t_s: float) -> dict:
     times = result["time_grid"]
     # ближайший шаг
     idx = min(range(len(times)), key=lambda k: abs(times[k] - t_s))
-    snap = result["snapshots"][idx]
+    # snap = geometry.snapshot(result["effective_scenario"], float(times[idx]))
+    snap = calc_snapshot_satellites(result["effective_scenario"], float(times[idx]))
     return {"t_s": times[idx], "snapshot": snap}
 
 
