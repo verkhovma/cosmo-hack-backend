@@ -7,6 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from collections import deque
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -89,10 +91,262 @@ class EditScenarioPayload(BaseModel):
 class SaveProjectPayload(BaseModel):
     title: str
     scenario: dict
+    save_anyway: bool = False
 
 
 class ComparePayload(BaseModel):
     job_ids: list[str] = Field(..., min_length=2)
+
+
+
+# ---------------------------------------------------------------------------
+# Объединение интервалов отказов (п.7)
+# ---------------------------------------------------------------------------
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    merged = [intervals[0]]
+    for s, e in intervals[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _normalize_outages(scenario: dict) -> dict:
+    """Сливает пересекающиеся интервалы отказов по каждому satellite_id / gateway_id."""
+    s = json.loads(json.dumps(scenario))
+
+    by_sat: dict[str, list[tuple[float, float]]] = {}
+    for f in s["failures"]:
+        by_sat.setdefault(f["satellite_id"], []).append((f["start_s"], f["end_s"]))
+    s["failures"] = [
+        {"satellite_id": sid, "start_s": a, "end_s": b}
+        for sid, ivs in by_sat.items()
+        for a, b in _merge_intervals(ivs)
+    ]
+
+    by_gw: dict[str, list[tuple[float, float]]] = {}
+    for f in s["gateway_outages"]:
+        by_gw.setdefault(f["gateway_id"], []).append((f["start_s"], f["end_s"]))
+    s["gateway_outages"] = [
+        {"gateway_id": gid, "start_s": a, "end_s": b}
+        for gid, ivs in by_gw.items()
+        for a, b in _merge_intervals(ivs)
+    ]
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Классификация причины перерыва (п.17)
+# ---------------------------------------------------------------------------
+REASON_NO_VISIBLE = "no_visible_satellite"
+REASON_NO_ISL = "no_isl_path"
+REASON_NO_GATEWAY = "no_gateway_contact"
+REASON_GATEWAY_OFFLINE = "gateway_offline"
+REASON_OK = "ok"
+
+
+
+def _classify_reason(
+    scenario: dict,
+    snap: dict,
+    client_id: str,
+    adj: dict,
+    gateway_ids: list[str],
+    t_s: float,
+) -> str:
+    """Классификация причины перерыва. Возвращает одну из REASON_*."""
+    # 1. Все шлюзы offline?
+    gws_offline = {
+        f["gateway_id"]
+        for f in scenario.get("gateway_outages", [])
+        if f["start_s"] <= t_s < f["end_s"]
+    }
+    if gws_offline and set(gateway_ids).issubset(gws_offline):
+        return REASON_GATEWAY_OFFLINE
+
+    # 2. Есть ли видимые спутники у клиента?
+    visible = [
+        e[1] for e in snap["edges"]
+        if e[0] == client_id and e[1].startswith("S")
+    ]
+    if not visible:
+        return REASON_NO_VISIBLE
+
+    # 3. Достижим ли хотя бы один видимый спутник до любого шлюза?
+    for v in visible:
+        q = deque([v])
+        seen = {v}
+        while q:
+            u = q.popleft()
+            for w, _ in adj.get(u, ()):
+                if w in seen:
+                    continue
+                if w in gateway_ids:
+                    return REASON_OK
+                seen.add(w)
+                q.append(w)
+
+    # 4. Видим, но не доходит. Различаем причины.
+    any_isl = any(
+        e[0].startswith("S") and e[1].startswith("S")
+        for e in snap["edges"]
+    )
+    if not any_isl:
+        return REASON_NO_ISL
+
+    gw_visible = any(
+        (e[0] in gateway_ids and e[1].startswith("S"))
+        or (e[1] in gateway_ids and e[0].startswith("S"))
+        for e in snap["edges"]
+    )
+    return REASON_NO_ISL if gw_visible else REASON_NO_GATEWAY
+
+
+
+# ---------------------------------------------------------------------------
+# Полный расчёт с маршрутами и причинами
+# ---------------------------------------------------------------------------
+
+def _run_computation(scenario: dict) -> dict:
+    """
+    Полный расчёт:
+      1) snapshot на каждом шаге сетки;
+      2) маршруты BFS от каждого клиента до любого доступного шлюза;
+      3) причины перерывов;
+      4) лог видимости спутников для каждого клиента;
+      5) метрики по каждому клиенту.
+    """
+    scenario = _normalize_outages(scenario)
+    e = scenario["environment"]
+    step = e["step_s"]
+    horizon = e["horizon_s"]
+    times = list(range(0, horizon, step))
+
+    clients = [g["id"] for g in scenario["ground_sites"] if g["role"] == "client"]
+    gateways = [g["id"] for g in scenario["ground_sites"] if g["role"] == "gateway"]
+
+    # routes[client_id] = [{t_s, path, reason}, ...]
+    routes: dict[str, list[dict]] = {c: [] for c in clients}
+    # visible_log[client_id][t_index] = [sat_id, ...]
+    visible_log: dict[str, list[list[str]]] = {c: [] for c in clients}
+
+    snapshots_compact: list[dict] = []
+
+    t0 = time.perf_counter()
+
+    for t in times:
+        snap = geometry.snapshot(scenario, float(t))
+
+        # строим граф смежности
+        adj: dict[str, list[tuple[str, float]]] = {}
+        for a, b, w in snap["edges"]:
+            adj.setdefault(a, []).append((b, w))
+            adj.setdefault(b, []).append((a, w))
+
+        # видимость спутников для каждого наземного пункта
+        sat_visible: dict[str, list[str]] = {
+            s["id"]: [] for s in scenario["design"]["satellites"]
+        }
+        for a, b, _ in snap["edges"]:
+            if a.startswith("S") and not b.startswith("S"):
+                sat_visible.setdefault(a, []).append(b)
+            elif b.startswith("S") and not a.startswith("S"):
+                sat_visible.setdefault(b, []).append(a)
+
+        snapshots_compact.append({
+            "t_s": t,
+            "satellites": [
+                {**s, "visible_to": sat_visible.get(s["id"], [])}
+                for s in snap["satellites"]
+            ],
+            "edges": snap["edges"],
+        })
+
+        for cid in clients:
+            # BFS до ближайшего шлюза
+            best_path: list[str] | None = None
+            for gw in gateways:
+                path = _bfs(adj, cid, gw)
+                if path and (best_path is None or len(path) < len(best_path)):
+                    best_path = path
+
+            reason = (
+                REASON_OK
+                if best_path
+                else _classify_reason(scenario, snap, cid, adj, gateways, float(t))
+            )
+            routes[cid].append({
+                "t_s": t,
+                "path": best_path,
+                "reason": reason,
+            })
+
+            # список видимых клиенту спутников
+            visible_sats = [
+                e2[1] for e2 in snap["edges"]
+                if e2[0] == cid and e2[1].startswith("S")
+            ]
+            visible_log[cid].append(visible_sats)
+
+    elapsed = time.perf_counter() - t0
+
+    # метрики
+    metrics: dict[str, dict] = {}
+    for cid in clients:
+        rs = routes[cid]
+        avail = [r["path"] is not None for r in rs]
+        max_gap = cur = 0
+        for a in avail:
+            cur = 0 if a else cur + 1
+            max_gap = max(max_gap, cur)
+        metrics[cid] = {
+            "availability": sum(avail) / len(avail) if avail else 0.0,
+            "max_gap_s": max_gap * step,
+            "hop_counts": [
+                len(r["path"]) - 1 if r["path"] else None for r in rs
+            ],
+        }
+
+    return {
+        "schema_version": "cosmo-A-result-1.0",
+        "effective_scenario": scenario,
+        "computed_at": time.time(),
+        "elapsed_s": elapsed,
+        "time_grid": times,
+        "snapshots": snapshots_compact,
+        "routes": routes,
+        "visible_log": visible_log,
+        "metrics": metrics,
+        "target_availability": e["target_availability"],
+    }
+
+
+
+def _bfs(adj: dict, src: str, dst: str) -> list[str] | None:
+    if src == dst:
+        return [src]
+    if src not in adj or dst not in adj:
+        return None
+    prev = {src: None}
+    q = deque([src])
+    while q:
+        v = q.popleft()
+        for w, _ in adj.get(v, ()):
+            if w in prev:
+                continue
+            prev[w] = v
+            if w == dst:
+                path = [w]
+                while prev[path[-1]] is not None:
+                    path.append(prev[path[-1]])
+                return path[::-1]
+            q.append(w)
+    return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -141,87 +395,6 @@ def _apply_edits(scenario: dict, edits: EditScenarioPayload) -> dict:
     return s
 
 
-def _run_computation(scenario: dict) -> dict:
-    """
-    Полный расчёт:
-      1) snapshot на каждом шаге сетки;
-      2) маршруты BFS от каждого клиента до любого доступного шлюза;
-      3) метрики по каждому клиенту.
-    """
-    e = scenario["environment"]
-    step = e["step_s"]
-    horizon = e["horizon_s"]
-    times = list(range(0, horizon, step))
-
-    clients = [g for g in scenario["ground_sites"] if g["role"] == "client"]
-    gateways = [g["id"] for g in scenario["ground_sites"] if g["role"] == "gateway"]
-
-    # routes[client_id][t_index] = path | None
-    routes: dict[str, list[Optional[list[str]]]] = {c["id"]: [] for c in clients}
-    snapshots_compact: list[dict] = []
-
-    t0 = time.perf_counter()
-
-    for t in times:
-        snap = geometry.snapshot(scenario, float(t))
-        adj = routing.build_adjacency(snap)
-
-        # компактное представление для фронта
-        snapshots_compact.append({
-            "t_s": t,
-            "satellites": snap["satellites"],
-            "edges": snap["edges"],
-        })
-
-        for c in clients:
-            cid = c["id"]
-            best: Optional[list[str]] = None
-            for gw in gateways:
-                path = routing.bfs_route(adj, cid, gw)
-                if path is not None:
-                    # предпочитаем более короткий маршрут
-                    if best is None or len(path) < len(best):
-                        best = path
-            routes[cid].append(best)
-
-    elapsed = time.perf_counter() - t0
-
-    # метрики
-    per_client: dict[str, dict] = {}
-    for c in clients:
-        cid = c["id"]
-        rs = routes[cid]
-        per_client[cid] = {
-            "availability": metrics_mod.availability(rs),
-            "max_gap_s": metrics_mod.max_gap_steps(rs) * step,
-            "hop_counts": metrics_mod.hop_counts(rs),
-            "routes": [
-                {"t_s": times[k], "path": rs[k]}
-                for k in range(len(times))
-            ],
-        }
-
-    result = {
-        "schema_version": SCHEMA_OUT,
-        "effective_scenario": scenario,
-        "computed_at": time.time(),
-        "elapsed_s": elapsed,
-        "time_grid": times,
-        "snapshots": snapshots_compact,
-        "routes": {
-            cid: per_client[cid]["routes"] for cid in per_client
-        },
-        "metrics": {
-            cid: {
-                "availability": per_client[cid]["availability"],
-                "max_gap_s": per_client[cid]["max_gap_s"],
-            }
-            for cid in per_client
-        },
-        "target_availability": e["target_availability"],
-    }
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Эндпоинты: сценарии
@@ -266,17 +439,20 @@ def validate_scenario(payload: ScenarioPayload) -> dict:
 
 
 @app.post("/api/scenarios/upload")
-async def upload_scenario(file: UploadFile = File(...)) -> dict:
+async def upload_scenario(file: UploadFile = File(...)):
     raw = await file.read()
     try:
         scenario = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HTTPException(400, f"Invalid JSON: {exc}")
+
+    validation_errors: list[str] = []
     try:
         geometry.validate(scenario)
     except ValueError as exc:
-        raise HTTPException(400, f"Validation failed: {exc}")
-    return {"scenario": scenario, "meta": scenario["meta"]}
+        validation_errors.append(str(exc))
+
+    return {"scenario": scenario, "validation_errors": validation_errors}
 
 
 # ---------------------------------------------------------------------------
@@ -330,16 +506,14 @@ def get_snapshot(job_id: str, t_s: float) -> dict:
 
 
 @app.get("/api/compute/{job_id}/routes")
-def get_routes(job_id: str, client_id: str) -> dict:
+def get_routes(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(404, "Job not found")
-    result = JOBS[job_id]
-    if client_id not in result["routes"]:
-        raise HTTPException(404, f"Unknown client: {client_id}")
+    r = JOBS[job_id]
     return {
-        "client_id": client_id,
-        "routes": result["routes"][client_id],
-        "metrics": result["metrics"][client_id],
+        "routes": r["routes"],           # {cid: [{t_s, path, reason}]}
+        "visible_log": r["visible_log"], # {cid: [[sat_id, ...], ...]}
+        "metrics": r["metrics"],
     }
 
 
@@ -356,20 +530,19 @@ def get_metrics(job_id: str) -> dict:
 
 
 @app.get("/api/compute/{job_id}/export")
-def export_result(job_id: str) -> JSONResponse:
+def export_result(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(404, "Job not found")
-    result = JOBS[job_id]
-    # компактный формат выгрузки
+    r = JOBS[job_id]
     payload = {
-        "schema_version": SCHEMA_OUT,
-        "effective_scenario": result["effective_scenario"],
+        "schema_version": "cosmo-A-result-1.0",
+        "effective_scenario": r["effective_scenario"],
         "routes": [
-            {"t_s": r["t_s"], "client_id": cid, "path": r["path"]}
-            for cid, rs in result["routes"].items()
-            for r in rs
+            {"t_s": e["t_s"], "client_id": cid, "path": e["path"]}
+            for cid, entries in r["routes"].items()
+            for e in entries
         ],
-        "metrics": result["metrics"],
+        "metrics": r["metrics"],
     }
     return JSONResponse(
         content=payload,
@@ -381,13 +554,26 @@ def export_result(job_id: str) -> JSONResponse:
 # Эндпоинты: сохранение проектов
 # ---------------------------------------------------------------------------
 @app.post("/api/projects")
-def create_project(payload: SaveProjectPayload) -> dict:
+def create_project(payload: SaveProjectPayload):
+    validation_errors: list[str] = []
     try:
         geometry.validate(payload.scenario)
     except ValueError as exc:
-        raise HTTPException(400, f"Invalid scenario: {exc}")
+        validation_errors.append(str(exc))
+
+    if validation_errors and not payload.save_anyway:
+        raise HTTPException(400, {
+            "error": "validation_failed",
+            "detail": validation_errors,
+            "hint": "Передайте save_anyway=true, чтобы сохранить всё равно",
+        })
+
     pid = storage.save_project(payload.title, payload.scenario)
-    return {"id": pid, "title": payload.title}
+    return {
+        "id": pid,
+        "title": payload.title,
+        "validation_warnings": validation_errors,
+    }
 
 
 @app.get("/api/projects")
